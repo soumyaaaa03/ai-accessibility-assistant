@@ -1,0 +1,15 @@
+opencv-python
+ultralytics
+easyocr
+faster-whisper
+mediapipe
+streamlit
+pyttsx3
+SpeechRecognition
+Pillow
+numpy
+deepface
+tf-keras
+joblib
+scikit-learn
+sounddevice
