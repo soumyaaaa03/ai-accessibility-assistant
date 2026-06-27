@@ -1,140 +1,177 @@
-# deaf/collect_gestures.py
-# PURPOSE: Collect labeled hand landmark data for gesture recognition
-# LIBRARY: cvzone (wraps MediaPipe Hands — same accuracy, simpler code)
-# OUTPUT: data/gestures.csv
-
+# deaf/gesture.py
+import mediapipe as mp
 import cv2
 import numpy as np
-import csv
-import os
-from cvzone.HandTrackingModule import HandDetector
+import time
 
-# ── Detector Setup ────────────────────────────────────────────────
-# HandDetector wraps MediaPipe internally
-# maxHands=1 — only track one hand
-# detectionCon=0.7 — 70% confidence required to detect a hand
+BaseOptions = mp.tasks.BaseOptions
+GestureRecognizer = mp.tasks.vision.GestureRecognizer
+GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
 
-detector = HandDetector(maxHands=1, detectionCon=0.7)
+GESTURE_MAP = {
+    "Thumb_Up":    "Yes",
+    "Thumb_Down":  "No",
+    "Open_Palm":   "Hello",
+    "Victory":     "Peace",
+    "ILoveYou":    "Thank You",
+    "Pointing_Up": "Attention",
+    "Closed_Fist": "Stop",
+    "None":        ""
+}
 
-# ── Output File Setup ─────────────────────────────────────────────
-DATA_DIR = "data"
-CSV_PATH = os.path.join(DATA_DIR, "gestures.csv")
-os.makedirs(DATA_DIR, exist_ok=True)
+# 21 landmark connections for drawing hand skeleton
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (0,9),(9,10),(10,11),(11,12),
+    (0,13),(13,14),(14,15),(15,16),
+    (0,17),(17,18),(18,19),(19,20),
+    (5,9),(9,13),(13,17)
+]
 
-COLUMNS = ["label"] + [f"{axis}{i}" for i in range(21)
-                        for axis in ("x", "y", "z")]
+
+def load_gesture_model(model_path="models/gesture_recognizer.task"):
+    options = GestureRecognizerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionRunningMode.IMAGE
+    )
+    recognizer = GestureRecognizer.create_from_options(options)
+    print("✅ Gesture recognizer loaded")
+    return recognizer
 
 
-# ── Normalization ─────────────────────────────────────────────────
-def normalize_landmarks(lm_list):
+def draw_landmarks_on_frame(frame, hand_landmarks_list):
     """
-    lm_list from cvzone looks like:
-    [[x0,y0,z0], [x1,y1,z1], ... [x20,y20,z20]]
-    21 points, each with x,y,z pixel coordinates
-
-    We normalize so gesture works at any hand size or distance:
-    1. Make wrist the origin (subtract point 0 from all points)
-    2. Scale by wrist-to-middle-fingertip distance (point 12)
+    Draws hand skeleton using pure OpenCV.
+    
+    hand_landmarks_list comes directly from result.hand_landmarks
+    In MediaPipe Task API this is a list of lists — each inner list
+    has 21 NormalizedLandmark objects with .x .y .z attributes
+    
+    We wrap everything in try/except so a drawing failure
+    never crashes the main loop
     """
-    points = np.array(lm_list, dtype=float)
+    try:
+        h, w = frame.shape[:2]
 
-    # Keep only x,y,z — cvzone sometimes gives 4 values, we need 3
-    points = points[:, :3]
+        for hand_landmarks in hand_landmarks_list:
+            # Build pixel coordinate list from normalized landmarks
+            points = {}
+            for idx, landmark in enumerate(hand_landmarks):
+                px = int(landmark.x * w)
+                py = int(landmark.y * h)
+                # Clamp to frame boundaries — prevents drawing outside frame
+                px = max(0, min(w - 1, px))
+                py = max(0, min(h - 1, py))
+                points[idx] = (px, py)
 
-    # Step 1: wrist becomes origin
-    wrist = points[0].copy()
-    points -= wrist
+            # Draw connection lines
+            for start_idx, end_idx in HAND_CONNECTIONS:
+                if start_idx in points and end_idx in points:
+                    cv2.line(frame, points[start_idx], points[end_idx],
+                             (0, 200, 255), 2)
 
-    # Step 2: scale normalization
-    scale = np.linalg.norm(points[12])
-    if scale < 1e-6:
-        scale = 1e-6
-    points /= scale
+            # Draw landmark dots
+            for idx, point in points.items():
+                cv2.circle(frame, point, 5, (0, 255, 0), -1)
 
-    return points.flatten().tolist()
+    except Exception as e:
+        print(f"⚠️ Drawing error (non-fatal): {e}")
 
-
-# ── Main Collection Loop ──────────────────────────────────────────
-def collect():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("❌ Camera not found")
-        return
-
-    file_exists = os.path.exists(CSV_PATH)
-    csv_file = open(CSV_PATH, "a", newline="")
-    writer = csv.writer(csv_file)
-    if not file_exists:
-        writer.writerow(COLUMNS)
-
-    label_map = {
-        ord('1'): "hello",
-        ord('2'): "yes",
-        ord('3'): "no",
-        ord('4'): "thankyou"
-    }
-
-    current_label = None
-    counts = {"hello": 0, "yes": 0, "no": 0, "thankyou": 0}
-
-    print("=" * 50)
-    print("GESTURE DATA COLLECTION")
-    print("=" * 50)
-    print("1 → hello  |  2 → yes  |  3 → no  |  4 → thankyou")
-    print("0 → pause  |  Q → quit and save")
-    print("Collect 100+ samples per gesture")
-    print("=" * 50)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Flip for mirror view — more natural to use
-        frame = cv2.flip(frame, 1)
-
-        # findHands does detection + draws skeleton on frame automatically
-        # returns list of hand dicts, and the annotated frame
-        detected_hands, frame = detector.findHands(frame)
-
-        if detected_hands and current_label is not None:
-            # lmList = list of 21 landmarks, each [x, y, z]
-            lm_list = detected_hands[0]["lmList"]
-            features = normalize_landmarks(lm_list)
-            writer.writerow([current_label] + features)
-            counts[current_label] += 1
-
-        # ── Status display ────────────────────────────────────────
-        status = f"Collecting: {current_label}" if current_label else "Paused — press 1-4"
-        color = (0, 255, 0) if current_label else (0, 0, 255)
-        cv2.putText(frame, status, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        y = 60
-        for gesture, count in counts.items():
-            cv2.putText(frame, f"{gesture}: {count}", (10, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (255, 255, 255), 1)
-            y += 25
-
-        cv2.imshow("Gesture Collection", frame)
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in label_map:
-            current_label = label_map[key]
-            print(f"▶ Collecting: {current_label}")
-        elif key == ord('0'):
-            current_label = None
-            print("⏸ Paused")
-        elif key == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    csv_file.close()
-    print("\n✅ Saved to data/gestures.csv")
-    print("Final counts:", counts)
+    return frame
 
 
-if __name__ == "__main__":
-    collect()
+def recognize_gesture(frame, recognizer):
+    """
+    Full pipeline with isolated error handling at every step.
+    Returns (gesture_label, mapped_word, annotated_frame)
+    Never crashes — always returns something safe.
+    """
+
+    # Step 1: Prepare frame safely
+    try:
+        if frame is None or frame.size == 0:
+            return "None", "", frame
+
+        # Ensure correct dtype
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8)
+
+        # Make a copy so we don't modify the original
+        display_frame = frame.copy()
+
+        # BGR → RGB conversion
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Force contiguous memory layout — critical for MediaPipe on Windows
+        rgb_frame = np.ascontiguousarray(rgb_frame, dtype=np.uint8)
+
+    except Exception as e:
+        print(f"⚠️ Frame prep error: {e}")
+        return "None", "", frame
+
+    # Step 2: Run MediaPipe recognition
+    try:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = recognizer.recognize(mp_image)
+
+    except Exception as e:
+        print(f"⚠️ MediaPipe error: {e}")
+        return "None", "", display_frame
+
+    # Step 3: Parse gesture result
+    try:
+        gesture_label = "None"
+        mapped_word = ""
+
+        if result.gestures:
+            top_gesture = result.gestures[0][0]
+            gesture_label = top_gesture.category_name
+            confidence = top_gesture.score
+
+            print(f"   [debug] {gesture_label} | {confidence:.2f}")
+
+            if confidence >= 0.6:
+                mapped_word = GESTURE_MAP.get(gesture_label, gesture_label)
+            else:
+                gesture_label = "None"
+
+    except Exception as e:
+        print(f"⚠️ Result parsing error: {e}")
+        return "None", "", display_frame
+
+    # Step 4: Draw landmarks
+    try:
+        if result.hand_landmarks:
+            display_frame = draw_landmarks_on_frame(
+                display_frame,
+                result.hand_landmarks
+            )
+    except Exception as e:
+        print(f"⚠️ Landmark draw error: {e}")
+        # Don't return here — we still have the gesture result
+
+    return gesture_label, mapped_word, display_frame
+
+
+class GestureDebouncer:
+    def __init__(self, cooldown=2.0):
+        self.last_gesture = ""
+        self.last_reported_time = 0
+        self.cooldown = cooldown
+
+    def should_report(self, gesture_label):
+        now = time.time()
+        time_since_last = now - self.last_reported_time
+
+        if gesture_label != self.last_gesture:
+            self.last_gesture = gesture_label
+            self.last_reported_time = now
+            return True
+
+        if time_since_last > self.cooldown:
+            self.last_reported_time = now
+            return True
+
+        return False
